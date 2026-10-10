@@ -85,6 +85,33 @@ def _clean_wikitext_text(text: str) -> str:
     return out + "\n" if out else ""
 
 
+def _load_datasets_wikitext103() -> list[tuple[str, str]] | None:
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("datasets not installed, run `pip install datasets` for WikiText-103 primary source", file=sys.stderr)
+        return None
+    try:
+        ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1")
+    except Exception as e:
+        print(f"datasets wikitext-103 unavailable ({e})", file=sys.stderr)
+        return None
+    try:
+        wanted = [("train", "train"), ("validation", "valid"), ("test", "test")]
+        parts: list[tuple[str, str]] = []
+        for ds_split, out_split in wanted:
+            if ds_split not in ds:
+                continue
+            raw = "\n".join(str(r.get("text", "") if isinstance(r, dict) else r) for r in ds[ds_split])
+            cleaned = _clean_wikitext_text(raw)
+            if len(cleaned.strip()) >= 500:
+                parts.append((out_split, cleaned))
+        return parts or None
+    except Exception as e:
+        print(f"datasets wikitext-103 parse failed ({e})", file=sys.stderr)
+        return None
+
+
 def _load_s3_zip(out: Path, force: bool = False, timeout: int = 30) -> list[tuple[str, str]] | None:
     zip_path = out / "wikitext-103-raw-v1.zip"
     try:
@@ -213,26 +240,28 @@ def build_wiki(
         except (ValueError, KeyError, OSError) as e:
             print(f"manifest re-read failed ({manifest_path}: {e}), rebuilding", file=sys.stderr)
 
-    raw_parts: list[tuple[str, str]] = []
-    s3_parts = _load_s3_zip(out, force=force, timeout=timeout)
-    if s3_parts and len(s3_parts) == len(WT103_S3_MEMBERS):
-        raw_parts = s3_parts
-    else:
+    raw_parts: list[tuple[str, str]] = _load_datasets_wikitext103() or []
+    if len(raw_parts) < len(WT103_URLS):
+        s3_parts = _load_s3_zip(out, force=force, timeout=timeout)
         if s3_parts:
-            raw_parts = s3_parts
-        for split, url in WT103_URLS:
-            if any(s == split for s, _ in raw_parts):
-                continue
-            cache_path = out / f"{split}.txt"
-            if cache_path.exists() and cache_path.stat().st_size > 0 and not force:
-                raw_parts.append((split, cache_path.read_text(encoding="utf-8", errors="ignore")))
-                continue
-            text = _fetch_url(url, timeout=timeout)
-            if text and len(text.strip()) >= 1000:
-                cache_path.write_text(text, encoding="utf-8")
-                raw_parts.append((split, text))
-            else:
-                print(f"primary {split} unavailable, trying fallback", file=sys.stderr)
+            have_s3 = {s for s, _ in raw_parts}
+            for s, t in s3_parts:
+                if s not in have_s3:
+                    raw_parts.append((s, t))
+        if len(raw_parts) < len(WT103_URLS):
+            for split, url in WT103_URLS:
+                if any(s == split for s, _ in raw_parts):
+                    continue
+                cache_path = out / f"{split}.txt"
+                if cache_path.exists() and cache_path.stat().st_size > 0 and not force:
+                    raw_parts.append((split, cache_path.read_text(encoding="utf-8", errors="ignore")))
+                    continue
+                text = _fetch_url(url, timeout=timeout)
+                if text and len(text.strip()) >= 1000:
+                    cache_path.write_text(text, encoding="utf-8")
+                    raw_parts.append((split, text))
+                else:
+                    print(f"primary {split} unavailable, trying fallback", file=sys.stderr)
 
     if len(raw_parts) < len(WT103_URLS):
         have = {s for s, _ in raw_parts}
