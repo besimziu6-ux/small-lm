@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -71,18 +72,42 @@ def _fetch_bytes(url: str, timeout: int = 30) -> bytes | None:
         return None
 
 
+def clean_wiki_text(t: str) -> str:
+    if not t:
+        return ""
+    t = t.replace(" @-@ ", "-").replace(" @,@ ", ",").replace(" @.@ ", ".")
+    t = t.replace("@-@", "-").replace("@,@", ",").replace("@.@", ".")
+    for old, new in [
+        (" ,", ","),
+        (" .", "."),
+        (" !", "!"),
+        (" ?", "?"),
+        (" :", ":"),
+        (" ;", ";"),
+        (" 's", "'s"),
+        ("( ", "("),
+        (" )", ")"),
+    ]:
+        t = t.replace(old, new)
+    lines = t.split("\n")
+    out_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if len(stripped) >= 2 and stripped.startswith("=") and stripped.endswith("="):
+            inner = stripped.strip("= ").strip()
+            if not inner:
+                continue
+            line = inner
+        out_lines.append(line)
+    t = "\n".join(out_lines)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    if t and not t.endswith("\n"):
+        t += "\n"
+    return t
+
+
 def _clean_wikitext_text(text: str) -> str:
-    kept: list[str] = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        if line.startswith(" = "):
-            continue
-        if line.strip().startswith("="):
-            continue
-        kept.append(line)
-    out = "\n".join(kept)
-    return out + "\n" if out else ""
+    return clean_wiki_text(text)
 
 
 def _load_datasets_wikitext103() -> list[tuple[str, str]] | None:
@@ -293,6 +318,7 @@ def build_wiki(
         target = max_bytes if max_bytes is not None else SYNTHETIC_FALLBACK_BYTES
         combined = _synthetic_corpus(seed=seed, target_bytes=target)
 
+    combined = clean_wiki_text(combined)
     shards = _split_shards(combined, shard_bytes)
 
     for old in sorted(out.glob("shard_*.txt")):
