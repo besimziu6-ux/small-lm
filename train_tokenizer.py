@@ -116,7 +116,13 @@ def decode_ids(ids: list[int] | object, inv_vocab: dict[int, str], skip_specials
 def build_rank(merges: list[str]) -> dict[tuple[str, str], int]:
     rank: dict[tuple[str, str], int] = {}
     for i, m in enumerate(merges):
-        a, _, b = m.partition(" ")
+        if isinstance(m, (list, tuple)):
+            parts = [str(x) for x in m]
+            if len(parts) != 2:
+                continue
+            a, b = parts
+        else:
+            a, _, b = str(m).partition(" ")
         if not a or not b:
             continue
         key = (a, b)
@@ -223,8 +229,16 @@ def hf_train(files: list[Path], vocab_size: int, min_frequency: int) -> tuple[di
     tok.train([str(f) for f in files], trainer)
     vocab = tok.get_vocab()
     raw = json.loads(tok.to_str())
-    merges = raw.get("model", {}).get("merges", [])
-    return dict(vocab), list(merges)
+    raw_merges = raw.get("model", {}).get("merges", [])
+    merges: list[str] = []
+    for m in raw_merges:
+        if isinstance(m, (list, tuple)):
+            parts = [str(x) for x in m]
+            if len(parts) == 2:
+                merges.append(f"{parts[0]} {parts[1]}")
+        else:
+            merges.append(str(m))
+    return dict(vocab), merges
 
 
 def save_tokenizer(path: Path, vocab: dict[str, int], merges: list[str], backend: str) -> None:
@@ -255,7 +269,7 @@ def load_tokenizer_file(path: str | Path) -> tuple[dict[str, int], list[str], di
     data = json.loads(p.read_text(encoding="utf-8"))
     if "vocab" in data and "merges" in data:
         vocab = {str(k): int(v) for k, v in data["vocab"].items()}
-        merges = [str(m) for m in data["merges"]]
+        merges = [f"{m[0]} {m[1]}" if isinstance(m, (list, tuple)) else str(m) for m in data["merges"]]
         specials = {PAD_TOKEN: PAD_ID, UNK_TOKEN: UNK_ID, BOS_TOKEN: BOS_ID, EOS_TOKEN: EOS_ID}
         if isinstance(data.get("special_ids"), dict):
             try:
