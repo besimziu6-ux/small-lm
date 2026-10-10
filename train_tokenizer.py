@@ -28,6 +28,135 @@ SPECIAL_IDS = {PAD_TOKEN: PAD_ID, UNK_TOKEN: UNK_ID, BOS_TOKEN: BOS_ID, EOS_TOKE
 TOKEN_RE = re.compile(r"\S+|\s+")
 
 
+def _build_bytes_to_unicode() -> dict[int, str]:
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {b: chr(c) for b, c in zip(bs, cs)}
+
+
+_BYTE_TO_UNICODE: dict[int, str] = _build_bytes_to_unicode()
+_UNICODE_TO_BYTES: dict[str, int] = {v: k for k, v in _BYTE_TO_UNICODE.items()}
+
+_HF_BYTELEVEL = None
+
+
+def _get_hf_bytelevel():
+    global _HF_BYTELEVEL
+    if _HF_BYTELEVEL is not None:
+        return _HF_BYTELEVEL
+    try:
+        from tokenizers.pre_tokenizers import ByteLevel
+
+        _HF_BYTELEVEL = ByteLevel(add_prefix_space=False)
+        return _HF_BYTELEVEL
+    except Exception:
+        return None
+
+
+def _byte_encode_piece(s: str) -> str:
+    return "".join(_BYTE_TO_UNICODE[b] for b in s.encode("utf-8"))
+
+
+def _byte_decode_string(s: str) -> str:
+    buf = bytearray()
+    out: list[str] = []
+    for ch in s:
+        b = _UNICODE_TO_BYTES.get(ch)
+        if b is None:
+            if buf:
+                out.append(bytes(buf).decode("utf-8", errors="replace"))
+                buf.clear()
+            out.append(ch)
+            continue
+        buf.append(b)
+    if buf:
+        out.append(bytes(buf).decode("utf-8", errors="replace"))
+    return "".join(out)
+
+
+def _byte_level_pieces(text: str) -> list[str]:
+    if not text:
+        return []
+    pt = _get_hf_bytelevel()
+    if pt is not None:
+        try:
+            return [t for t, _ in pt.pre_tokenize_str(text)]
+        except Exception:
+            pass
+    try:
+        import regex as _re_mod
+
+        found = _re_mod.findall(
+            r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""",
+            text,
+        )
+    except ImportError:
+        found = re.findall(
+            r"""'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+(?!\S)|\s+""",
+            text,
+        )
+    if not found:
+        return [_byte_encode_piece(text)]
+    return [_byte_encode_piece(p) for p in found]
+
+
+def encode_text_bytelevel(
+    text: str, vocab: dict[str, int], rank: dict[tuple[str, str], int], unk_id: int = UNK_ID
+) -> list[int]:
+    ids: list[int] = []
+    for piece in _byte_level_pieces(text):
+        for tok in _encode_word(piece, rank):
+            ids.append(vocab.get(tok, unk_id))
+    return ids
+
+
+def decode_ids_bytelevel(ids: list[int] | object, inv_vocab: dict[int, str], skip_specials: bool = True) -> str:
+    try:
+        import torch
+
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+    except ImportError:
+        pass
+    seq = list(ids)  # type: ignore[arg-type]
+    skip = {PAD_TOKEN, BOS_TOKEN, EOS_TOKEN} if skip_specials else set()
+    parts: list[str] = []
+    for i in seq:
+        tok = inv_vocab.get(int(i), UNK_TOKEN)  # type: ignore[arg-type]
+        if tok in skip:
+            continue
+        if skip_specials and tok.startswith("<extra_"):
+            continue
+        parts.append(tok)
+    return _byte_decode_string("".join(parts))
+
+
+def _is_bytelevel_file(path: str | Path) -> bool:
+    try:
+        p = resolve_path(path)
+        if not p.exists():
+            alt = SCRIPT_DIR / Path(path).name
+            if alt.exists():
+                p = alt
+            else:
+                return False
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if data.get("pre_tokenizer") == "bytelevel":
+            return True
+        pt = data.get("pre_tokenizer")
+        if isinstance(pt, dict) and pt.get("type") == "ByteLevel":
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _collect_files(inp: Path) -> list[Path]:
     if inp.is_dir():
         files = sorted(inp.glob("*.txt"))
@@ -213,12 +342,13 @@ def fallback_train(texts: list[str], vocab_size: int, min_frequency: int = 2) ->
 def hf_train(files: list[Path], vocab_size: int, min_frequency: int) -> tuple[dict[str, int], list[str]]:
     from tokenizers import Tokenizer
     from tokenizers.models import BPE
-    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers import decoders, pre_tokenizers
     from tokenizers.trainers import BpeTrainer
 
     tok = Tokenizer(BPE(unk_token=UNK_TOKEN))
-    tok.pre_tokenizer = Whitespace()
-    initial = [chr(i) for i in range(32, 127)] + ["\n", "\t", "\r"]
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    initial = pre_tokenizers.ByteLevel.alphabet()
     trainer = BpeTrainer(
         vocab_size=vocab_size,
         min_frequency=min_frequency,
@@ -241,10 +371,13 @@ def hf_train(files: list[Path], vocab_size: int, min_frequency: int) -> tuple[di
     return dict(vocab), merges
 
 
-def save_tokenizer(path: Path, vocab: dict[str, int], merges: list[str], backend: str) -> None:
+def save_tokenizer(path: Path, vocab: dict[str, int], merges: list[str], backend: str, pre_tokenizer: str | None = None) -> None:
+    if pre_tokenizer is None:
+        pre_tokenizer = "bytelevel" if backend == "hf-bpe" else "whitespace"
     payload = {
         "version": 1,
         "backend": backend,
+        "pre_tokenizer": pre_tokenizer,
         "vocab_size": len(vocab),
         "vocab": vocab,
         "merges": merges,
@@ -285,7 +418,7 @@ def load_tokenizer_file(path: str | Path) -> tuple[dict[str, int], list[str], di
 
 
 class SimpleTokenizer:
-    def __init__(self, vocab: dict[str, int], merges: list[str]) -> None:
+    def __init__(self, vocab: dict[str, int], merges: list[str], is_bytelevel: bool = False) -> None:
         self.vocab = vocab
         self.merges = merges
         self.rank = build_rank(merges)
@@ -294,19 +427,25 @@ class SimpleTokenizer:
         self.unk_id = vocab.get(UNK_TOKEN, UNK_ID)
         self.bos_id = vocab.get(BOS_TOKEN, BOS_ID)
         self.eos_id = vocab.get(EOS_TOKEN, EOS_ID)
+        self.is_bytelevel = is_bytelevel
 
     @classmethod
     def from_file(cls, path: str | Path) -> SimpleTokenizer:
         vocab, merges, _ = load_tokenizer_file(path)
-        return cls(vocab, merges)
+        return cls(vocab, merges, is_bytelevel=_is_bytelevel_file(path))
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        ids = encode_text(text, self.vocab, self.rank, self.unk_id)
+        if self.is_bytelevel:
+            ids = encode_text_bytelevel(text, self.vocab, self.rank, self.unk_id)
+        else:
+            ids = encode_text(text, self.vocab, self.rank, self.unk_id)
         if add_special_tokens:
             ids = [self.bos_id] + ids + [self.eos_id]
         return ids
 
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+        if self.is_bytelevel:
+            return decode_ids_bytelevel(ids, self.inv_vocab, skip_specials=skip_special_tokens)
         return decode_ids(ids, self.inv_vocab, skip_specials=skip_special_tokens)
 
     def roundtrip(self, text: str) -> tuple[list[int], str, bool]:
@@ -364,8 +503,9 @@ def train_tokenizer(
     pad_vocab_to_size(vocab, vocab_size)
     if len(vocab) != vocab_size:
         raise ValueError(f"vocab_size check failed: got {len(vocab)}, want {vocab_size}")
-    save_tokenizer(out, vocab, merges, backend)
-    tok = SimpleTokenizer(vocab, merges)
+    pre_tok = "bytelevel" if backend == "hf-bpe" else "whitespace"
+    save_tokenizer(out, vocab, merges, backend, pre_tok)
+    tok = SimpleTokenizer(vocab, merges, is_bytelevel=(pre_tok == "bytelevel"))
     sample_texts = _read_texts(files)
     probe = ""
     for t in sample_texts:

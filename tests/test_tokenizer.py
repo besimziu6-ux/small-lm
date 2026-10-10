@@ -15,6 +15,18 @@ def test_roundtrip():
         "hello world",
         "Once upon a time",
         "The quick brown fox jumps over the lazy dog",
+        "hello, world!",
+        "hello  world",
+        " leading and trailing ",
+        "don't stop",
+        "price $100.00 (50% off!)",
+        "a\tb\nc",
+        "café — test",
+        "résumé",
+        "foo-bar: a:b;c",
+        "   multiple   spaces   ",
+        "line1\nline2\nline3",
+        "Hello,  world!!  test...",
     ]
     for text in cases:
         ids, back, ok = tok.roundtrip(text)

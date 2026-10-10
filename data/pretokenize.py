@@ -66,11 +66,75 @@ def _is_hf_format(path: Path) -> bool:
     return isinstance(data, dict) and "model" in data
 
 
-def _load_encoder(tok_path: Path):
-    if _is_hf_format(tok_path):
-        try:
-            from tokenizers import Tokenizer
+def _is_bytelevel_payload(data: dict) -> bool:
+    if data.get("pre_tokenizer") == "bytelevel":
+        return True
+    pt = data.get("pre_tokenizer")
+    if isinstance(pt, dict) and pt.get("type") == "ByteLevel":
+        return True
+    return False
 
+
+def _merges_to_tuples(raw_merges: list) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for m in raw_merges:
+        if isinstance(m, (list, tuple)):
+            if len(m) == 2:
+                out.append((str(m[0]), str(m[1])))
+            continue
+        s = str(m)
+        a, sep, b = s.partition(" ")
+        if sep and a and b:
+            out.append((a, b))
+    return out
+
+
+def _load_encoder(tok_path: Path):
+    try:
+        from tokenizers import Tokenizer
+        from tokenizers.models import BPE
+        from tokenizers import pre_tokenizers
+    except ImportError:
+        from train_tokenizer import SimpleTokenizer
+
+        tok = SimpleTokenizer.from_file(tok_path)
+        single = lambda text: tok.encode(text)  # noqa: E731
+        return single, None, int(tok.bos_id), int(tok.eos_id), int(len(tok.vocab)), False
+    try:
+        data = json.loads(tok_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"tokenizer read failed ({tok_path}: {e}), using SimpleTokenizer", file=sys.stderr)
+        from train_tokenizer import SimpleTokenizer
+
+        tok = SimpleTokenizer.from_file(tok_path)
+        single = lambda text: tok.encode(text)  # noqa: E731
+        return single, None, int(tok.bos_id), int(tok.eos_id), int(len(tok.vocab)), False
+    if isinstance(data, dict) and "vocab" in data and "merges" in data:
+        try:
+            vocab = {str(k): int(v) for k, v in data["vocab"].items()}
+            merges = _merges_to_tuples(data.get("merges", []))
+            is_bl = _is_bytelevel_payload(data)
+            hf = Tokenizer(BPE(vocab=vocab, merges=merges, unk_token="<unk>"))
+            if is_bl:
+                hf.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+            else:
+                hf.pre_tokenizer = pre_tokenizers.Whitespace()
+
+            bos = int(vocab.get("<bos>", 2))
+            eos = int(vocab.get("<eos>", 3))
+            vs = len(vocab)
+
+            def encode(text: str) -> list[int]:
+                return hf.encode(text, add_special_tokens=False).ids
+
+            def encode_batch(texts: list[str]) -> list[list[int]]:
+                return [e.ids for e in hf.encode_batch(texts, add_special_tokens=False)]
+
+            return encode, encode_batch, bos, eos, vs, True
+        except (ValueError, RuntimeError, OSError) as e:
+            print(f"hf in-memory build failed ({tok_path}: {e}), using SimpleTokenizer", file=sys.stderr)
+    elif _is_hf_format(tok_path):
+        try:
             hf = Tokenizer.from_file(str(tok_path))
             vocab = hf.get_vocab()
             bos = int(vocab.get("<bos>", 2))
@@ -80,7 +144,10 @@ def _load_encoder(tok_path: Path):
             def encode(text: str) -> list[int]:
                 return hf.encode(text, add_special_tokens=False).ids
 
-            return encode, bos, eos, vs, True
+            def encode_batch(texts: list[str]) -> list[list[int]]:
+                return [e.ids for e in hf.encode_batch(texts, add_special_tokens=False)]
+
+            return encode, encode_batch, bos, eos, vs, True
         except ImportError:
             pass
         except (ValueError, RuntimeError, OSError) as e:
@@ -88,7 +155,7 @@ def _load_encoder(tok_path: Path):
     from train_tokenizer import SimpleTokenizer
 
     tok = SimpleTokenizer.from_file(tok_path)
-    return (lambda text: tok.encode(text)), int(tok.bos_id), int(tok.eos_id), int(len(tok.vocab)), False
+    return (lambda text: tok.encode(text)), None, int(tok.bos_id), int(tok.eos_id), int(len(tok.vocab)), False
 
 
 def _write_bin(path: Path, ids: list[int], dtype: str) -> None:
@@ -128,19 +195,42 @@ def pretokenize(
     files = _collect_inputs(inp)
     if not files:
         raise FileNotFoundError(f"no .txt shards under {inp}")
-    encode, bos, eos, vocab_size, fast = _load_encoder(tok_path)
+    encode, encode_batch, bos, eos, vocab_size, fast = _load_encoder(tok_path)
     mode = "hf-rust" if fast else "SimpleTokenizer"
     print(f"tokenizer={tok_path} vocab_size={vocab_size} mode={mode} dtype={dtype}")
+    try:
+        first_text = files[0].read_text(encoding="utf-8", errors="ignore")
+        sample = first_text[: 2 * 1024 * 1024]
+        if sample.strip():
+            probe_ids = encode(sample)
+            if probe_ids:
+                nbytes = len(sample.encode("utf-8"))
+                print(f"probe bytes/token={nbytes / len(probe_ids):.2f} (sample {nbytes} bytes -> {len(probe_ids)} ids)")
+            else:
+                print("probe bytes/token=N/A (empty sample)")
+        else:
+            print("probe bytes/token=N/A (empty first shard)")
+    except Exception as e:
+        print(f"probe failed: {e}", file=sys.stderr)
     shard_ids: list[list[int]] = []
     global_max = -1
     for i, src in enumerate(files):
         text = src.read_text(encoding="utf-8", errors="ignore")
         docs = _split_docs(text)
+        if encode_batch is not None:
+            try:
+                batch = encode_batch(docs)
+            except Exception:
+                batch = [encode(d) for d in docs]
+        else:
+            batch = [encode(d) for d in docs]
         ids: list[int] = []
-        for d in docs:
-            enc = encode(d)[:max_doc_tokens]
+        for enc in batch:
+            enc = enc[:max_doc_tokens]
             if enc:
-                global_max = max(global_max, max(enc))
+                m = max(enc)
+                if m > global_max:
+                    global_max = m
             ids.append(bos)
             ids.extend(enc)
             ids.append(eos)
