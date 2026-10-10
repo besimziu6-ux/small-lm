@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import sys
 from pathlib import Path
@@ -153,6 +154,189 @@ def load_id_bins(manifest_or_dir: str | Path, dtype: str | None = None) -> list[
     return out
 
 
+class IdBinStore:
+    def __init__(self, files: list[Path], dtype_str: str, shard_lens: list[int], cum: list[int]) -> None:
+        import numpy as np
+
+        self.files = [Path(f) for f in files]
+        self.dtype_str = str(dtype_str)
+        self._np_dtype = np.dtype(_ID_DTYPES[self.dtype_str])
+        self.itemsize = int(self._np_dtype.itemsize)
+        self.shard_lens = [int(n) for n in shard_lens]
+        self.cum = [int(n) for n in cum]
+        self.total = int(self.cum[-1]) if self.cum else 0
+        self._maps: list | None = None
+        self._open()
+
+    def _open(self) -> None:
+        import numpy as np
+
+        if self._maps is not None:
+            return
+        maps: list = []
+        for f, n in zip(self.files, self.shard_lens):
+            if n <= 0:
+                maps.append(np.empty((0,), dtype=self._np_dtype))
+            else:
+                maps.append(np.memmap(str(f), dtype=self._np_dtype, mode="r", shape=(n,)))
+        self._maps = maps
+
+    def _ensure_open(self) -> None:
+        if self._maps is None:
+            self._open()
+
+    def __len__(self) -> int:
+        return int(self.total)
+
+    def __getstate__(self) -> dict:
+        d = dict(self.__dict__)
+        d["_maps"] = None
+        d.pop("_np_dtype", None)
+        return d
+
+    def __setstate__(self, d: dict) -> None:
+        import numpy as np
+
+        self.__dict__.update(d)
+        self._np_dtype = np.dtype(_ID_DTYPES[self.dtype_str])
+        self._maps = None
+
+    def _locate(self, idx: int) -> tuple[int, int]:
+        k = bisect.bisect_right(self.cum, idx) - 1
+        if k < 0:
+            k = 0
+        if k >= len(self.shard_lens):
+            k = len(self.shard_lens) - 1
+        return k, idx - self.cum[k]
+
+    def __getitem__(self, idx: int | slice) -> int | object:
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(self.total)
+            if step != 1:
+                return [self[i] for i in range(start, stop, step)]
+            return self.read_span(start, stop - start)
+        j = int(idx)
+        if j < 0:
+            j += self.total
+        if j < 0 or j >= self.total:
+            raise IndexError(j)
+        self._ensure_open()
+        assert self._maps is not None
+        k, local = self._locate(j)
+        return int(self._maps[k][local])
+
+    def read_span(self, start: int, length: int) -> object:
+        import numpy as np
+
+        start = int(start)
+        length = int(length)
+        if length <= 0:
+            return np.empty((0,), dtype=self._np_dtype)
+        if start < 0 or start + length > self.total:
+            raise IndexError(f"span [{start},{start + length}) outside 0..{self.total}")
+        self._ensure_open()
+        assert self._maps is not None
+        k, local = self._locate(start)
+        if local + length <= self.shard_lens[k]:
+            return np.array(self._maps[k][local : local + length], copy=True)
+        parts = []
+        cur = start
+        remaining = length
+        while remaining > 0:
+            kk, loc = self._locate(cur)
+            take = min(remaining, self.shard_lens[kk] - loc)
+            parts.append(np.array(self._maps[kk][loc : loc + take], copy=True))
+            cur += take
+            remaining -= take
+        return np.concatenate(parts) if parts else np.empty((0,), dtype=self._np_dtype)
+
+    def close(self) -> None:
+        self._maps = None
+
+
+def open_id_bins(manifest_or_dir: str | Path, dtype: str | None = None) -> IdBinStore:
+    man_path, base = _resolve_id_manifest(manifest_or_dir)
+    if not man_path.exists():
+        raise FileNotFoundError(f"id manifest not found: {man_path}")
+    man = json.loads(man_path.read_text(encoding="utf-8"))
+    man_dtype = str(man.get("dtype", "uint16"))
+    if dtype is not None and dtype != man_dtype:
+        raise ValueError(f"dtype mismatch: reader expects '{dtype}' but manifest '{man_path}' has '{man_dtype}'")
+    if man_dtype not in _ID_DTYPES:
+        raise ValueError(f"unknown dtype '{man_dtype}' in {man_path}, want 'uint16' or 'uint32'")
+    shards = man.get("shards", [])
+    if shards:
+        files = [base / s["file"] for s in shards]
+    else:
+        files = sorted(base.glob("*.bin"))
+    if not files:
+        raise FileNotFoundError(f"no *.bin shards under {base}")
+    import numpy as np
+
+    np_dtype = np.dtype(_ID_DTYPES[man_dtype])
+    itemsize = int(np_dtype.itemsize)
+    shard_lens: list[int] = []
+    for f in files:
+        if not f.exists():
+            raise FileNotFoundError(f"id shard not found: {f}")
+        size = f.stat().st_size
+        if size % itemsize != 0:
+            raise ValueError(f"corrupt bin {f}: {size} bytes not divisible by {itemsize}")
+        shard_lens.append(size // itemsize)
+    cum = [0]
+    for n in shard_lens:
+        cum.append(cum[-1] + n)
+    return IdBinStore([Path(f) for f in files], man_dtype, shard_lens, cum)
+
+
+def _split_id_range(total: int, val_split: float = VAL_SPLIT) -> tuple[tuple[int, int], tuple[int, int]]:
+    total = int(total)
+    if total <= 0:
+        return (0, 0), (0, 0)
+    n_val = int(total * val_split)
+    n_train = total - n_val
+    if n_train <= 0:
+        n_train = total
+        n_val = 0
+    return (0, n_train), (n_train, n_val)
+
+
+def _resolve_tiled_view(avail_len: int, seq_len: int, min_blocks: int) -> tuple[int, bool, bool]:
+    width = int(seq_len) + 1
+    need = int(min_blocks) * width
+    avail_len = int(avail_len)
+    if avail_len <= 0:
+        if need <= 0:
+            return 0, False, True
+        return need, False, True
+    if avail_len >= need:
+        return avail_len, False, False
+    return need, True, False
+
+
+def _num_blocks_for_len(logical_len: int, seq_len: int) -> int:
+    width = int(seq_len) + 1
+    logical_len = int(logical_len)
+    if logical_len <= 0:
+        return 0
+    return (logical_len + width - 1) // width
+
+
+def log_ids_memory(store: IdBinStore | None = None, manifest_or_dir: str | Path | None = None) -> str:
+    if store is None:
+        if manifest_or_dir is None:
+            raise ValueError("log_ids_memory needs store or manifest_or_dir")
+        store = open_id_bins(manifest_or_dir)
+    total = int(store.total)
+    nfiles = len(store.files)
+    msg = (
+        f"[ids] total_ids={total} dtype={store.dtype_str} ({store.itemsize} B/id) "
+        f"files={nfiles} shards memmap mode=r (no RAM copy)"
+    )
+    print(msg, flush=True)
+    return msg
+
+
 def _is_id_bin_dir(raw_path: str | Path) -> bool:
     p = resolve_path(raw_path)
     if p.is_file() and p.name == "manifest.json":
@@ -203,6 +387,14 @@ class CausalLMDataset:
 
         self.seq_len = seq_len
         self.pad_id = pad_id
+        self._is_memmap = False
+        self._store: IdBinStore | None = None
+        self._start = 0
+        self._avail_len = 0
+        self._logical_len = 0
+        self._tiled = False
+        self._pad_only = False
+        self._num_blocks = 0
         blocks = chunk_blocks(list(token_ids), seq_len=seq_len, pad_id=pad_id)
         inputs = []
         labels = []
@@ -215,11 +407,90 @@ class CausalLMDataset:
         self.inputs = torch.tensor(inputs, dtype=torch.long)
         self.labels = torch.tensor(labels, dtype=torch.long)
 
+    @classmethod
+    def from_id_range(
+        cls,
+        store: IdBinStore | None,
+        start: int,
+        avail_len: int,
+        seq_len: int = SEQ_LEN,
+        pad_id: int = PAD_ID,
+        min_blocks: int = 0,
+    ) -> CausalLMDataset:
+        self = cls.__new__(cls)
+        self.seq_len = int(seq_len)
+        self.pad_id = int(pad_id)
+        self._is_memmap = True
+        self._start = int(start)
+        self._avail_len = int(avail_len)
+        logical, tiled, pad_only = _resolve_tiled_view(int(avail_len), int(seq_len), int(min_blocks))
+        self._logical_len = int(logical)
+        self._tiled = bool(tiled)
+        self._pad_only = bool(pad_only)
+        if self._pad_only:
+            self._store = None
+        else:
+            self._store = store
+        self._num_blocks = _num_blocks_for_len(self._logical_len, int(seq_len))
+        return self
+
     def __len__(self) -> int:
+        if bool(getattr(self, "_is_memmap", False)):
+            return int(self._num_blocks)
         return self.inputs.shape[0]
 
     def __getitem__(self, idx: int) -> dict[str, object]:
+        if bool(getattr(self, "_is_memmap", False)):
+            return self._get_memmap_block(int(idx))
         return {"input_ids": self.inputs[idx], "labels": self.labels[idx]}
+
+    def _get_memmap_block(self, idx: int) -> dict[str, object]:
+        import numpy as np
+        import torch
+
+        n = int(self._num_blocks)
+        if idx < 0:
+            idx += n
+        if idx < 0 or idx >= n:
+            raise IndexError(idx)
+        width = int(self.seq_len) + 1
+        base = int(idx) * width
+        pad = int(self.pad_id)
+        if self._pad_only or self._logical_len <= 0:
+            blk = np.full((width,), pad, dtype=np.int64)
+        elif self._tiled:
+            assert self._store is not None
+            store = self._store
+            avail = int(self._avail_len)
+            start = int(self._start)
+            blk = np.empty((width,), dtype=np.int64)
+            filled = 0
+            cur_off = (base % avail) if avail > 0 else 0
+            while filled < width:
+                take = min(avail - cur_off, width - filled)
+                span = store.read_span(start + cur_off, take)
+                blk[filled : filled + take] = np.asarray(span, dtype=np.int64)
+                filled += take
+                cur_off = 0
+        else:
+            assert self._store is not None
+            store = self._store
+            start = int(self._start)
+            avail = int(self._avail_len)
+            if base >= avail:
+                blk = np.full((width,), pad, dtype=np.int64)
+            elif avail - base >= width:
+                span = store.read_span(start + base, width)
+                blk = np.array(span, dtype=np.int64, copy=True)
+            else:
+                rem = avail - base
+                span = store.read_span(start + base, rem)
+                blk = np.full((width,), pad, dtype=np.int64)
+                blk[:rem] = np.asarray(span, dtype=np.int64)
+        x = np.array(blk[:-1], dtype=np.int64, copy=True)
+        y = np.array(blk[1:], dtype=np.int64, copy=True)
+        y[y == pad] = -100
+        return {"input_ids": torch.from_numpy(x), "labels": torch.from_numpy(y)}
 
 
 def build_datasets(
@@ -237,7 +508,28 @@ def build_datasets(
         raise ValueError(f"unknown source {source!r}, want 'auto', 'text' or 'ids'")
     use_ids = source == "ids" or (source == "auto" and _is_id_bin_dir(raw_path))
     if use_ids:
-        stream = load_id_bins(raw_path)
+        store = open_id_bins(raw_path)
+        log_ids_memory(store)
+        total = len(store)
+        (train_start, train_len), (val_start, val_len) = _split_id_range(total, val_split)
+        tok = SimpleTokenizer.from_file(resolve_path(tokenizer_path))
+        pad = tok.pad_id
+        train_ds = CausalLMDataset.from_id_range(store, train_start, train_len, seq_len, pad, min_train_blocks)
+        if val_len == 0:
+            width = int(seq_len) + 1
+            train_logical = int(train_ds._logical_len)
+            if train_logical >= width:
+                if train_len == 0:
+                    val_ds = CausalLMDataset.from_id_range(None, 0, 0, seq_len, pad, min_train_blocks)
+                else:
+                    val_ds = CausalLMDataset.from_id_range(store, train_start, train_len, seq_len, pad, min_train_blocks)
+            elif train_len == 0:
+                val_ds = CausalLMDataset.from_id_range(None, 0, 0, seq_len, pad, 1)
+            else:
+                val_ds = CausalLMDataset.from_id_range(store, train_start, train_len, seq_len, pad, 1)
+        else:
+            val_ds = CausalLMDataset.from_id_range(store, val_start, val_len, seq_len, pad, 1)
+        return train_ds, val_ds
     else:
         stream = tokenize_stream(raw_path, tokenizer_path)
     train_ids, val_ids = split_train_val(stream, val_split)
