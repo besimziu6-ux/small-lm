@@ -4,6 +4,7 @@ import argparse
 import json
 import random
 import sys
+import zipfile
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -26,6 +27,13 @@ try:
 except ImportError:
     def set_all_seeds(seed, **kwargs):  # type: ignore[no-redef]
         random.seed(seed)
+
+WT103_S3_ZIP_URL = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip"
+WT103_S3_MEMBERS = [
+    ("train", "wikitext-103-raw/wiki.train.tokens"),
+    ("valid", "wikitext-103-raw/wiki.valid.tokens"),
+    ("test", "wikitext-103-raw/wiki.test.tokens"),
+]
 
 WT103_URLS = [
     ("train", "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-103-raw-v1/train.txt"),
@@ -50,6 +58,63 @@ def _fetch_url(url: str, timeout: int = 30) -> str | None:
         return raw.decode("utf-8", errors="ignore")
     except (OSError, ValueError) as e:
         print(f"fetch failed ({url}: {e})", file=sys.stderr)
+        return None
+
+
+def _fetch_bytes(url: str, timeout: int = 30) -> bytes | None:
+    try:
+        req = Request(url, headers={"User-Agent": "small-lm/1.0"})
+        with urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except (OSError, ValueError) as e:
+        print(f"fetch failed ({url}: {e})", file=sys.stderr)
+        return None
+
+
+def _clean_wikitext_text(text: str) -> str:
+    kept: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith(" = "):
+            continue
+        if line.strip().startswith("="):
+            continue
+        kept.append(line)
+    out = "\n".join(kept)
+    return out + "\n" if out else ""
+
+
+def _load_s3_zip(out: Path, force: bool = False, timeout: int = 30) -> list[tuple[str, str]] | None:
+    zip_path = out / "wikitext-103-raw-v1.zip"
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        extracted = [(split, out / member) for split, member in WT103_S3_MEMBERS]
+        if not force and all(p.exists() and p.stat().st_size > 0 for _, p in extracted):
+            parts: list[tuple[str, str]] = []
+            for split, p in extracted:
+                parts.append((split, _clean_wikitext_text(p.read_text(encoding="utf-8", errors="ignore"))))
+            if all(len(t.strip()) >= 1000 for _, t in parts):
+                return parts
+        if not (zip_path.exists() and zip_path.stat().st_size > 0 and not force):
+            blob = _fetch_bytes(WT103_S3_ZIP_URL, timeout=timeout)
+            if not blob:
+                return None
+            zip_path.write_bytes(blob)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(out)
+        parts = []
+        for split, member in WT103_S3_MEMBERS:
+            p = out / member
+            if not p.exists() or p.stat().st_size == 0:
+                return None
+            text = _clean_wikitext_text(p.read_text(encoding="utf-8", errors="ignore"))
+            if len(text.strip()) < 500:
+                return None
+            parts.append((split, text))
+        return parts
+    except (OSError, ValueError, zipfile.BadZipFile) as e:
+        print(f"s3 wikitext-103 zip unavailable ({e})", file=sys.stderr)
         return None
 
 
@@ -149,17 +214,25 @@ def build_wiki(
             print(f"manifest re-read failed ({manifest_path}: {e}), rebuilding", file=sys.stderr)
 
     raw_parts: list[tuple[str, str]] = []
-    for split, url in WT103_URLS:
-        cache_path = out / f"{split}.txt"
-        if cache_path.exists() and cache_path.stat().st_size > 0 and not force:
-            raw_parts.append((split, cache_path.read_text(encoding="utf-8", errors="ignore")))
-            continue
-        text = _fetch_url(url, timeout=timeout)
-        if text and len(text.strip()) >= 1000:
-            cache_path.write_text(text, encoding="utf-8")
-            raw_parts.append((split, text))
-        else:
-            print(f"primary {split} unavailable, trying fallback", file=sys.stderr)
+    s3_parts = _load_s3_zip(out, force=force, timeout=timeout)
+    if s3_parts and len(s3_parts) == len(WT103_S3_MEMBERS):
+        raw_parts = s3_parts
+    else:
+        if s3_parts:
+            raw_parts = s3_parts
+        for split, url in WT103_URLS:
+            if any(s == split for s, _ in raw_parts):
+                continue
+            cache_path = out / f"{split}.txt"
+            if cache_path.exists() and cache_path.stat().st_size > 0 and not force:
+                raw_parts.append((split, cache_path.read_text(encoding="utf-8", errors="ignore")))
+                continue
+            text = _fetch_url(url, timeout=timeout)
+            if text and len(text.strip()) >= 1000:
+                cache_path.write_text(text, encoding="utf-8")
+                raw_parts.append((split, text))
+            else:
+                print(f"primary {split} unavailable, trying fallback", file=sys.stderr)
 
     if len(raw_parts) < len(WT103_URLS):
         have = {s for s, _ in raw_parts}
