@@ -26,16 +26,40 @@ PRESET_DEFAULTS = {
         "max_steps": 300,
         "micro_batch": 8,
         "effective_batch": 32,
-        "eval_every": 50,
+        "eval_every": 100,
         "save_every": 200,
+        "lr": 3e-4,
+        "warmup_steps": 50,
     },
     "base": {
         "seq_len": 256,
         "max_steps": 1000,
         "micro_batch": 4,
         "effective_batch": 32,
-        "eval_every": 100,
+        "eval_every": 250,
         "save_every": 200,
+        "lr": 3e-4,
+        "warmup_steps": 100,
+    },
+    "base_100m": {
+        "seq_len": 256,
+        "max_steps": 1000,
+        "micro_batch": 4,
+        "effective_batch": 32,
+        "eval_every": 250,
+        "save_every": 200,
+        "lr": 3e-4,
+        "warmup_steps": 200,
+    },
+    "gpt2_124m": {
+        "seq_len": 512,
+        "max_steps": 1000,
+        "micro_batch": 4,
+        "effective_batch": 32,
+        "eval_every": 250,
+        "save_every": 200,
+        "lr": 3e-4,
+        "warmup_steps": 300,
     },
 }
 
@@ -47,18 +71,31 @@ CLIP_DEFAULT = 1.0
 SEED_DEFAULT = 42
 
 
+def resolve_lr_warmup(preset: str, lr_arg=None, warmup_arg=None):
+    d = PRESET_DEFAULTS.get(preset, {})
+    lr = lr_arg if lr_arg is not None else d.get("lr", LR_DEFAULT)
+    warmup = warmup_arg if warmup_arg is not None else d.get("warmup_steps", WARMUP_DEFAULT)
+    return lr, warmup
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="train loop for small-lm")
-    p.add_argument("--preset", default="smoke", choices=["smoke", "base"])
+    p.add_argument("--preset", default="smoke", choices=["smoke", "base", "base_100m", "gpt2_124m"])
     p.add_argument("--device", default="cpu", choices=["auto", "cpu", "cuda"],
                    help="device to use (default: %(default)s)")
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=None)
     p.add_argument("--seq-len", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=None, help="effective batch (default 32)")
+    p.add_argument("--batch-size", type=int, default=None, help="effective batch (default 32; must be divisible by --micro-batch)")
     p.add_argument("--micro-batch", type=int, default=None)
-    p.add_argument("--lr", type=float, default=LR_DEFAULT)
-    p.add_argument("--warmup-steps", type=int, default=WARMUP_DEFAULT)
+    p.add_argument("--amp", default="off", choices=["off", "bf16"],
+                   help="autocast mode on cuda: off or bf16 (GradScaler-free; default: %(default)s)")
+    p.add_argument("--num-workers", type=int, default=0,
+                   help="DataLoader num_workers (default: %(default)s; pin_memory auto-enabled on cuda)")
+    p.add_argument("--lr", type=float, default=None,
+                   help="learning rate (default: per-preset: smoke 3e-4, base 3e-4, base_100m 3e-4, gpt2_124m 3e-4)")
+    p.add_argument("--warmup-steps", type=int, default=None,
+                   help="warmup steps (default: per-preset: smoke 50, base 100, base_100m 200, gpt2_124m 300)")
     p.add_argument("--weight-decay", type=float, default=WD_DEFAULT)
     p.add_argument("--grad-clip", type=float, default=CLIP_DEFAULT)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
@@ -91,6 +128,9 @@ def validate_args(args) -> None:
         raise SystemExit(2)
     if args.warmup_steps is not None and args.warmup_steps < 0:
         print(f"error: --warmup-steps must be >= 0 (got {args.warmup_steps})", file=sys.stderr)
+        raise SystemExit(2)
+    if args.num_workers is not None and args.num_workers < 0:
+        print(f"error: --num-workers must be >= 0 (got {args.num_workers})", file=sys.stderr)
         raise SystemExit(2)
 
 
@@ -152,7 +192,7 @@ def save_checkpoint(path: Path, payload: dict) -> None:
     torch.save(payload, path)
 
 
-def evaluate(model, val_loader, vocab_size: int, unk_id: int, max_batches: int, device: str = "cpu") -> float:
+def evaluate(model, val_loader, vocab_size: int, unk_id: int, max_batches: int, device: str = "cpu", use_amp: bool = False) -> float:
     model.eval()
     total = 0.0
     count = 0
@@ -173,10 +213,17 @@ def evaluate(model, val_loader, vocab_size: int, unk_id: int, max_batches: int, 
                 torch.tensor(unk_id, dtype=labels.dtype, device=labels.device),
                 labels,
             )
-            logits = model(input_ids)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
-            )
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model(input_ids)
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+                    )
+            else:
+                logits = model(input_ids)
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+                )
             total += float(loss.item())
             count += 1
     model.train()
@@ -195,6 +242,7 @@ def main(argv=None) -> None:
     save_every = args.save_every if args.save_every is not None else d["save_every"]
     effective = args.batch_size if args.batch_size is not None else d["effective_batch"]
     micro = args.micro_batch if args.micro_batch is not None else d["micro_batch"]
+    lr, warmup_steps = resolve_lr_warmup(preset, args.lr, args.warmup_steps)
     if effective % micro != 0:
         raise ValueError(f"effective batch {effective} must be divisible by micro {micro}")
     accum = effective // micro
@@ -233,11 +281,15 @@ def main(argv=None) -> None:
 
     from model import build_model
 
-    model = build_model(preset="smoke" if preset == "smoke" else "base", seed=args.seed, base_cfg=gc, init_settings=False)
+    model = build_model(preset=preset, seed=args.seed, base_cfg=gc, init_settings=False)
     model.train()
     model.to(torch.float32)
     model.to(device)
     vocab_size = int(model.cfg.vocab_size)
+
+    use_amp = bool(getattr(args, "amp", "off") == "bf16" and device == "cuda" and torch.cuda.is_available())
+    if getattr(args, "amp", "off") == "bf16" and not use_amp:
+        print("warning: --amp bf16 requested but CUDA unavailable, staying in float32", file=sys.stderr)
 
     from dataset import build_datasets
 
@@ -261,11 +313,15 @@ def main(argv=None) -> None:
 
     g = torch.Generator()
     g.manual_seed(args.seed)
+    pin = bool(device == "cuda")
+    workers = int(getattr(args, "num_workers", 0) or 0)
     train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=micro, shuffle=True, num_workers=0, generator=g
+        train_ds, batch_size=micro, shuffle=True, num_workers=workers,
+        pin_memory=pin, generator=g,
     )
     val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=micro, shuffle=False, num_workers=0
+        val_ds, batch_size=micro, shuffle=False, num_workers=workers,
+        pin_memory=pin,
     )
 
     decay, no_decay = [], []
@@ -282,10 +338,10 @@ def main(argv=None) -> None:
     ]
     if not decay:
         groups = [{"params": no_decay, "weight_decay": 0.0}]
-    opt = torch.optim.AdamW(groups, lr=args.lr, betas=BETAS_DEFAULT)
+    opt = torch.optim.AdamW(groups, lr=lr, betas=BETAS_DEFAULT)
 
     sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lr_lambda=lambda s: lr_lambda_fn(s, args.warmup_steps, max_steps)
+        opt, lr_lambda=lambda s: lr_lambda_fn(s, warmup_steps, max_steps)
     )
 
     resume_path = args.resume_from
@@ -358,7 +414,7 @@ def main(argv=None) -> None:
 
     step = start_step
     if step == 0 and eval_every > 0:
-        v0 = evaluate(model, val_loader, vocab_size, unk_id, args.max_val_batches, device)
+        v0 = evaluate(model, val_loader, vocab_size, unk_id, args.max_val_batches, device, use_amp)
         writer.writerow({"step": 0, "train_loss": "", "val_loss": f"{v0:.6f}", "lr": f"{opt.param_groups[0]['lr']:.8f}"})
         csv_file.flush()
         print(f"step 0 val={v0:.4f}")
@@ -382,10 +438,17 @@ def main(argv=None) -> None:
                 torch.tensor(unk_id, dtype=labels.dtype, device=labels.device),
                 labels,
             )
-            logits = model(input_ids)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
-            )
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model(input_ids)
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+                    )
+            else:
+                logits = model(input_ids)
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+                )
             (loss / accum).backward()
             acc_loss += float(loss.item())
         acc_loss /= 1.0
@@ -400,7 +463,7 @@ def main(argv=None) -> None:
         val_loss = ""
         vnum = None
         if do_eval:
-            vnum = evaluate(model, val_loader, vocab_size, unk_id, args.max_val_batches, device)
+            vnum = evaluate(model, val_loader, vocab_size, unk_id, args.max_val_batches, device, use_amp)
             val_loss = f"{vnum:.6f}"
             if vnum < best_val:
                 best_val = vnum

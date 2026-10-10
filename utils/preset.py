@@ -10,6 +10,10 @@ def normalize_preset(name: str) -> str:
         return "smoke"
     if n in ("base", "base_65m", "base-65m"):
         return "base"
+    if n in ("base_100m", "base-100m", "base100m"):
+        return "base_100m"
+    if n in ("gpt2_124m", "gpt2-124m", "gpt2124m", "gpt2"):
+        return "gpt2_124m"
     raise ValueError(f"unknown preset {name!r}")
 
 

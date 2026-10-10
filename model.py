@@ -43,7 +43,15 @@ def _load_preset_dict(preset: str) -> dict:
         from configs.base_65m import to_dict
 
         return to_dict()
-    raise ValueError(f"unknown preset {preset!r}; expected 'smoke' or 'base'")
+    if key in ("base_100m", "base-100m", "base100m"):
+        from configs.base_100m import to_dict
+
+        return to_dict()
+    if key in ("gpt2_124m", "gpt2-124m", "gpt2124m", "gpt2"):
+        from configs.gpt2_124m import to_dict
+
+        return to_dict()
+    raise ValueError(f"unknown preset {preset!r}; expected 'smoke', 'base', 'base_100m', or 'gpt2_124m'")
 
 
 def preset_to_config(preset: str) -> ModelConfig:
@@ -276,6 +284,10 @@ def build_model(preset: str = "base", seed: int = 42, base_cfg: Config | None = 
     total, _ = count_parameters(model)
     if preset.lower().strip() in ("base", "base_65m", "base-65m"):
         assert 50_000_000 <= total <= 100_000_000, f"base total {total:,} outside 50M-100M"
+    if preset.lower().strip() in ("base_100m", "base-100m", "base100m"):
+        assert 90_000_000 <= total <= 110_000_000, f"base_100m total {total:,} outside 90M-110M"
+    if preset.lower().strip() in ("gpt2_124m", "gpt2-124m", "gpt2124m", "gpt2"):
+        assert 110_000_000 <= total <= 140_000_000, f"gpt2_124m total {total:,} outside 110M-140M"
     return model
 
 
