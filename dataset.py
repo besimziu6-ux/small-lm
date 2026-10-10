@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -94,6 +95,75 @@ def tokenize_stream(raw_path: str | Path, tokenizer_path: str | Path, max_doc_to
     return stream
 
 
+_ID_DTYPES = {"uint16": "<u2", "uint32": "<u4"}
+
+
+def _resolve_id_manifest(manifest_or_dir: str | Path) -> tuple[Path, Path]:
+    p = resolve_path(manifest_or_dir)
+    if p.is_dir():
+        return p / "manifest.json", p
+    return p, p.parent
+
+
+def _read_bin(path: Path, dtype: str) -> list[int]:
+    if dtype not in _ID_DTYPES:
+        raise ValueError(f"unknown dtype {dtype!r} in manifest, want 'uint16' or 'uint32'")
+    try:
+        import numpy as np
+
+        arr = np.fromfile(str(path), dtype=np.dtype(_ID_DTYPES[dtype]))
+        return [int(x) for x in arr.tolist()]
+    except ImportError:
+        pass
+    import array
+
+    data = path.read_bytes()
+    itemsize = 2 if dtype == "uint16" else 4
+    if len(data) % itemsize != 0:
+        raise ValueError(f"corrupt bin {path}: {len(data)} bytes not divisible by {itemsize}")
+    a = array.array("H" if dtype == "uint16" else "I")
+    a.frombytes(data)
+    if sys.byteorder != "little":
+        a.byteswap()
+    return [int(x) for x in a]
+
+
+def load_id_bins(manifest_or_dir: str | Path, dtype: str | None = None) -> list[int]:
+    man_path, base = _resolve_id_manifest(manifest_or_dir)
+    if not man_path.exists():
+        raise FileNotFoundError(f"id manifest not found: {man_path}")
+    man = json.loads(man_path.read_text(encoding="utf-8"))
+    man_dtype = str(man.get("dtype", "uint16"))
+    if dtype is not None and dtype != man_dtype:
+        raise ValueError(f"dtype mismatch: reader expects '{dtype}' but manifest '{man_path}' has '{man_dtype}'")
+    if man_dtype not in _ID_DTYPES:
+        raise ValueError(f"unknown dtype '{man_dtype}' in {man_path}, want 'uint16' or 'uint32'")
+    shards = man.get("shards", [])
+    if shards:
+        files = [base / s["file"] for s in shards]
+    else:
+        files = sorted(base.glob("*.bin"))
+    if not files:
+        raise FileNotFoundError(f"no *.bin shards under {base}")
+    out: list[int] = []
+    for f in files:
+        if not f.exists():
+            raise FileNotFoundError(f"id shard not found: {f}")
+        out.extend(_read_bin(f, man_dtype))
+    return out
+
+
+def _is_id_bin_dir(raw_path: str | Path) -> bool:
+    p = resolve_path(raw_path)
+    if p.is_file() and p.name == "manifest.json":
+        return True
+    if not p.is_dir():
+        return False
+    if not (p / "manifest.json").exists():
+        return False
+    return len(sorted(p.glob("*.bin"))) > 0
+
+
 def split_train_val(ids: Sequence[int], val_split: float = VAL_SPLIT) -> tuple[list[int], list[int]]:
     n = len(ids)
     if n == 0:
@@ -160,9 +230,16 @@ def build_datasets(
     seed: int = 42,
     min_train_blocks: int = 8,
     deterministic: bool = True,
+    source: str = "auto",
 ) -> tuple[CausalLMDataset, CausalLMDataset]:
     _safe_seed(seed, deterministic=deterministic)
-    stream = tokenize_stream(raw_path, tokenizer_path)
+    if source not in ("auto", "text", "ids"):
+        raise ValueError(f"unknown source {source!r}, want 'auto', 'text' or 'ids'")
+    use_ids = source == "ids" or (source == "auto" and _is_id_bin_dir(raw_path))
+    if use_ids:
+        stream = load_id_bins(raw_path)
+    else:
+        stream = tokenize_stream(raw_path, tokenizer_path)
     train_ids, val_ids = split_train_val(stream, val_split)
     tok = SimpleTokenizer.from_file(resolve_path(tokenizer_path))
     pad = tok.pad_id
@@ -179,12 +256,13 @@ def get_dataloaders(
     batch_size: int = 8,
     seed: int = 42,
     deterministic: bool = True,
+    source: str = "auto",
 ) -> tuple[object, object]:
     import torch
 
     _safe_seed(seed, deterministic=deterministic)
     train_ds, val_ds = build_datasets(raw_path, tokenizer_path, seq_len=seq_len, seed=seed,
-                                       deterministic=deterministic)
+                                       deterministic=deterministic, source=source)
     g = torch.Generator()
     g.manual_seed(seed)
     train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, generator=g)  # type: ignore[arg-type]
