@@ -93,7 +93,7 @@ def main(argv=None) -> None:
 
     from model import build_model
 
-    model = build_model(preset=preset, seed=args.seed, base_cfg=gc)
+    model = build_model(preset=preset, seed=args.seed, base_cfg=gc, init_settings=False)
     model.to(torch.float32)
     model.to(device)
     model.eval()
@@ -116,7 +116,8 @@ def main(argv=None) -> None:
 
     raw_path = resolve_path(args.raw)
     _, val_ds = build_datasets(
-        raw_path, tok_path, seq_len=seq_len, seed=args.seed, min_train_blocks=8
+        raw_path, tok_path, seq_len=seq_len, seed=args.seed, min_train_blocks=8,
+        deterministic=wants_deterministic(device),
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0

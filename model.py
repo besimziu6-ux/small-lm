@@ -234,19 +234,21 @@ def _init_weights(model: SmallLM) -> None:
             model.lm_head.weight = model.tok_emb.weight
 
 
-def build_model(preset: str = "base", seed: int = 42, base_cfg: Config | None = None) -> SmallLM:
+def build_model(preset: str = "base", seed: int = 42, base_cfg: Config | None = None,
+                init_settings: bool = True) -> SmallLM:
     gc = base_cfg or Config()
-    try:
-        gc.apply_torch_settings()
-    except RuntimeError as e:
-        print(f"warning: torch settings failed ({e}), using defaults", file=sys.stderr)
-        torch.set_num_threads(gc.threads)
-    try:
-        set_all_seeds(seed if seed is not None else gc.seed, threads=gc.threads,
-                        deterministic=wants_deterministic(getattr(gc, "device", "cpu")))
-    except RuntimeError as e:
-        print(f"warning: deterministic seeding failed ({e}), continuing non-deterministically", file=sys.stderr)
-        torch.manual_seed(seed if seed is not None else gc.seed)
+    if init_settings:
+        try:
+            gc.apply_torch_settings()
+        except RuntimeError as e:
+            print(f"warning: torch settings failed ({e}), using defaults", file=sys.stderr)
+            torch.set_num_threads(gc.threads)
+        try:
+            set_all_seeds(seed if seed is not None else gc.seed, threads=gc.threads,
+                            deterministic=wants_deterministic(getattr(gc, "device", "cpu")))
+        except RuntimeError as e:
+            print(f"warning: deterministic seeding failed ({e}), continuing non-deterministically", file=sys.stderr)
+            torch.manual_seed(seed if seed is not None else gc.seed)
     try:
         _dev = resolve_device(getattr(gc, "device", "cpu"))
     except RuntimeError:

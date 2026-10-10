@@ -13,9 +13,9 @@ from utils.paths import resolve_path
 from utils.seed import set_all_seeds
 
 
-def _safe_seed(seed: int) -> None:
+def _safe_seed(seed: int, deterministic: bool = True) -> None:
     try:
-        set_all_seeds(seed)
+        set_all_seeds(seed, deterministic=deterministic)
     except RuntimeError:
         import random
 
@@ -159,8 +159,9 @@ def build_datasets(
     val_split: float = VAL_SPLIT,
     seed: int = 42,
     min_train_blocks: int = 8,
+    deterministic: bool = True,
 ) -> tuple[CausalLMDataset, CausalLMDataset]:
-    _safe_seed(seed)
+    _safe_seed(seed, deterministic=deterministic)
     stream = tokenize_stream(raw_path, tokenizer_path)
     train_ids, val_ids = split_train_val(stream, val_split)
     tok = SimpleTokenizer.from_file(resolve_path(tokenizer_path))
@@ -177,11 +178,13 @@ def get_dataloaders(
     seq_len: int = SEQ_LEN,
     batch_size: int = 8,
     seed: int = 42,
+    deterministic: bool = True,
 ) -> tuple[object, object]:
     import torch
 
-    _safe_seed(seed)
-    train_ds, val_ds = build_datasets(raw_path, tokenizer_path, seq_len=seq_len, seed=seed)
+    _safe_seed(seed, deterministic=deterministic)
+    train_ds, val_ds = build_datasets(raw_path, tokenizer_path, seq_len=seq_len, seed=seed,
+                                       deterministic=deterministic)
     g = torch.Generator()
     g.manual_seed(seed)
     train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, generator=g)  # type: ignore[arg-type]

@@ -141,7 +141,7 @@ def main(argv=None) -> None:
 
     from model import build_model
 
-    model = build_model(preset=preset, seed=args.seed, base_cfg=gc)
+    model = build_model(preset=preset, seed=args.seed, base_cfg=gc, init_settings=False)
     model.to(torch.float32)
     model.to(device)
     model.eval()

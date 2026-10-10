@@ -233,7 +233,7 @@ def main(argv=None) -> None:
 
     from model import build_model
 
-    model = build_model(preset="smoke" if preset == "smoke" else "base", seed=args.seed, base_cfg=gc)
+    model = build_model(preset="smoke" if preset == "smoke" else "base", seed=args.seed, base_cfg=gc, init_settings=False)
     model.train()
     model.to(torch.float32)
     model.to(device)
@@ -247,6 +247,7 @@ def main(argv=None) -> None:
     train_ds, val_ds = build_datasets(
         raw_path, tok_path, seq_len=seq_len, seed=args.seed,
         min_train_blocks=max(need_blocks, 8),
+        deterministic=wants_deterministic(device),
     )
 
     from train_tokenizer import SimpleTokenizer
