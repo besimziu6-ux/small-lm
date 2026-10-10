@@ -90,6 +90,8 @@ def parse_args(argv=None):
     p.add_argument("--micro-batch", type=int, default=None)
     p.add_argument("--amp", default="off", choices=["off", "bf16"],
                    help="autocast mode on cuda: off or bf16 (GradScaler-free; default: %(default)s)")
+    p.add_argument("--compile", default="off", choices=["off", "inductor"],
+                   help="torch.compile mode: off or inductor (reduce-overhead, cuda-only; default: %(default)s)")
     p.add_argument("--num-workers", type=int, default=0,
                    help="DataLoader num_workers (default: %(default)s; pin_memory auto-enabled on cuda)")
     p.add_argument("--lr", type=float, default=None,
@@ -192,6 +194,32 @@ def save_checkpoint(path: Path, payload: dict) -> None:
     torch.save(payload, path)
 
 
+def _model_state_dict(model) -> dict:
+    try:
+        inner = getattr(model, "_orig_mod", None)
+        if inner is not None:
+            return inner.state_dict()
+    except Exception:
+        pass
+    return model.state_dict()
+
+
+def _load_model_state(model, state) -> None:
+    try:
+        model.load_state_dict(state)
+        return
+    except RuntimeError:
+        pass
+    try:
+        inner = getattr(model, "_orig_mod", None)
+        if inner is not None:
+            inner.load_state_dict(state)
+            return
+    except RuntimeError:
+        pass
+    model.load_state_dict(state, strict=False)
+
+
 def evaluate(model, val_loader, vocab_size: int, unk_id: int, max_batches: int, device: str = "cpu", use_amp: bool = False) -> float:
     model.eval()
     total = 0.0
@@ -285,7 +313,16 @@ def main(argv=None) -> None:
     model.train()
     model.to(torch.float32)
     model.to(device)
-    vocab_size = int(model.cfg.vocab_size)
+    if getattr(args, "compile", "off") == "inductor":
+        if device == "cuda" and torch.cuda.is_available():
+            try:
+                model = torch.compile(model, mode="reduce-overhead")
+            except Exception as e:
+                print(f"warning: torch.compile failed ({e}), continuing uncompiled", file=sys.stderr)
+        else:
+            print("warning: --compile inductor requested but CUDA unavailable, continuing uncompiled",
+                  file=sys.stderr)
+    vocab_size = int(model.cfg.vocab_size) if hasattr(model, "cfg") else int(model._orig_mod.cfg.vocab_size)
 
     use_amp = bool(getattr(args, "amp", "off") == "bf16" and device == "cuda" and torch.cuda.is_available())
     if getattr(args, "amp", "off") == "bf16" and not use_amp:
@@ -369,7 +406,7 @@ def main(argv=None) -> None:
         except Exception:
             print(f"warning: weights_only load failed for {rp}, retrying trusted local load", file=sys.stderr)
             ckpt = torch.load(rp, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state"])
+        _load_model_state(model, ckpt["model_state"])
         opt.load_state_dict(ckpt["optimizer_state"])
         try:
             sched.load_state_dict(ckpt["scheduler_state"])
@@ -470,7 +507,7 @@ def main(argv=None) -> None:
                 best_path = ckpt_dir / f"best_{preset}.pt"
                 _rs = get_rng_states()
                 _payload = {
-                    "step": step, "model_state": model.state_dict(),
+                    "step": step, "model_state": _model_state_dict(model),
                     "optimizer_state": opt.state_dict(), "scheduler_state": sched.state_dict(),
                     "best_val": best_val, "train_loss": avg_loss, "val_loss": vnum,
                     "rng_python": _rs["python"],
@@ -498,7 +535,7 @@ def main(argv=None) -> None:
             ckpt_path = ckpt_dir / f"ckpt_{preset}_step{step}.pt"
             rs = get_rng_states()
             base_payload = {
-                "step": step, "model_state": model.state_dict(),
+                "step": step, "model_state": _model_state_dict(model),
                 "optimizer_state": opt.state_dict(), "scheduler_state": sched.state_dict(),
                 "best_val": best_val, "train_loss": avg_loss,
                 "val_loss": vnum if vnum is not None else float("nan"),

@@ -31,6 +31,7 @@ class ModelConfig:
     mlp: str = "gelu"
     tie_word_embeddings: bool = False
     dropout: float = 0.0
+    attn_implementation: str = "sdpa-causal"
 
 
 def _load_preset_dict(preset: str) -> dict:
@@ -68,6 +69,7 @@ def preset_to_config(preset: str) -> ModelConfig:
         mlp=str(d.get("mlp", "gelu")),
         tie_word_embeddings=bool(d.get("tie_word_embeddings", False)),
         dropout=float(d.get("dropout", 0.0)),
+        attn_implementation=str(d.get("attn_implementation", "sdpa-causal")),
     )
 
 
@@ -120,6 +122,15 @@ class CausalSelfAttention(torch.nn.Module):
         self.v_proj = torch.nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.o_proj = torch.nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.drop = torch.nn.Dropout(cfg.dropout)
+        self.attn_implementation = str(getattr(cfg, "attn_implementation", "sdpa-causal")).lower()
+
+    def _eager_causal_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        T = q.shape[-2]
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        mask = torch.ones(T, T, device=q.device, dtype=torch.bool).tril()
+        att = att.masked_fill(~mask, float("-inf"))
+        att = F.softmax(att.float(), dim=-1).to(q.dtype)
+        return att @ v
 
     def forward(self, x: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
         B, T, _ = x.shape
@@ -130,14 +141,15 @@ class CausalSelfAttention(torch.nn.Module):
             c = cos[:T].to(q.dtype).unsqueeze(0).unsqueeze(0)
             s = sin[:T].to(q.dtype).unsqueeze(0).unsqueeze(0)
             q, k = _apply_rope(q, k, c, s)
-        if hasattr(F, "scaled_dot_product_attention"):
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
+        if self.attn_implementation == "eager":
+            y = self._eager_causal_attention(q, k, v)
+        elif hasattr(F, "scaled_dot_product_attention"):
+            try:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
+            except Exception:
+                y = self._eager_causal_attention(q, k, v)
         else:
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            mask = torch.ones(T, T, device=x.device, dtype=torch.bool).tril()
-            att = att.masked_fill(~mask, float("-inf"))
-            att = F.softmax(att.float(), dim=-1).to(x.dtype)
-            y = att @ v
+            y = self._eager_causal_attention(q, k, v)
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         return self.drop(self.o_proj(y))
 
