@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from config import Config, resolve_device
-from utils.seed import set_all_seeds
+from utils.seed import set_all_seeds, wants_deterministic
 from utils.params import count_parameters, print_param_table
 
 
@@ -242,7 +242,8 @@ def build_model(preset: str = "base", seed: int = 42, base_cfg: Config | None = 
         print(f"warning: torch settings failed ({e}), using defaults", file=sys.stderr)
         torch.set_num_threads(gc.threads)
     try:
-        set_all_seeds(seed if seed is not None else gc.seed, threads=gc.threads)
+        set_all_seeds(seed if seed is not None else gc.seed, threads=gc.threads,
+                        deterministic=wants_deterministic(getattr(gc, "device", "cpu")))
     except RuntimeError as e:
         print(f"warning: deterministic seeding failed ({e}), continuing non-deterministically", file=sys.stderr)
         torch.manual_seed(seed if seed is not None else gc.seed)

@@ -40,14 +40,24 @@ class Config:
     )
 
     def apply_torch_settings(self) -> None:
+        import os
+
         import torch
 
         torch.set_num_threads(self.threads)
-        torch.set_num_interop_threads(self.threads)
+        try:
+            torch.set_num_interop_threads(self.threads)
+        except RuntimeError as e:
+            print(f"warning: interop threads already set ({e}), keeping existing", file=sys.stderr)
         torch.set_default_dtype(getattr(torch, self.dtype))
         torch.backends.cudnn.benchmark = self.cudnn_benchmark
         torch.backends.cudnn.deterministic = True
-        if self.use_deterministic_algorithms:
+        want_det = bool(self.use_deterministic_algorithms)
+        if want_det and str(self.device).lower() == "cuda" and "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+            print("warning: CUBLAS_WORKSPACE_CONFIG not set, disabling deterministic algorithms on CUDA "
+                  "(export CUBLAS_WORKSPACE_CONFIG=:4096:8 to re-enable)", file=sys.stderr)
+            want_det = False
+        if want_det:
             try:
                 torch.use_deterministic_algorithms(True)
             except RuntimeError as e:

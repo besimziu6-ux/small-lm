@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from config import Config, resolve_device
 from utils.paths import resolve_path
 from utils.preset import normalize_preset
-from utils.seed import set_all_seeds
+from utils.seed import set_all_seeds, wants_deterministic
 
 
 PRESET_DEFAULTS = {
@@ -210,13 +210,15 @@ def main(argv=None) -> None:
     except RuntimeError as e:
         print(f"warning: torch settings failed ({e}), using defaults", file=sys.stderr)
         torch.set_num_threads(gc.threads)
-        torch.set_num_interop_threads(gc.threads)
+        try:
+            torch.set_num_interop_threads(gc.threads)
+        except RuntimeError:
+            pass
     torch.set_default_dtype(torch.float32)
     try:
-        set_all_seeds(args.seed, threads=args.threads)
+        set_all_seeds(args.seed, threads=args.threads, deterministic=wants_deterministic(device))
     except RuntimeError as e:
         print(f"warning: deterministic seeding failed ({e}), continuing non-deterministically", file=sys.stderr)
-        random.seed(args.seed)
         torch.manual_seed(args.seed)
     if device == "cuda" and torch.cuda.is_available():
         try:
