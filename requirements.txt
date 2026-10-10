@@ -1,0 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.4
+tokenizers>=0.19
+numpy>=1.26
+tqdm>=4.66
+pytest>=8.3
